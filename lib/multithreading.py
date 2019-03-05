@@ -21,8 +21,9 @@ class PoolProcess():
 
         self.procs = self.set_procs(processes)
         ctx = mp.get_context("spawn")
-        self.pool = ctx.Pool(processes=self.procs)
-
+        self.pool = ctx.Pool(processes=self.procs,
+                             initializer=set_root_logger,
+                             initargs=(logger.getEffectiveLevel(), LOG_QUEUE))
         self._method = method
         self._kwargs = self.build_target_kwargs(in_queue, out_queue, kwargs)
         self._args = args
@@ -32,8 +33,6 @@ class PoolProcess():
     @staticmethod
     def build_target_kwargs(in_queue, out_queue, kwargs):
         """ Add standard kwargs to passed in kwargs list """
-        kwargs["log_init"] = set_root_logger
-        kwargs["log_queue"] = LOG_QUEUE
         kwargs["in_queue"] = in_queue
         kwargs["out_queue"] = out_queue
         return kwargs
@@ -83,9 +82,18 @@ class SpawnProcess(mp.context.SpawnProcess):
         kwargs["event"] = self.event
         kwargs["log_init"] = set_root_logger
         kwargs["log_queue"] = LOG_QUEUE
+        kwargs["log_level"] = logger.getEffectiveLevel()
         kwargs["in_queue"] = in_queue
         kwargs["out_queue"] = out_queue
         return kwargs
+
+    def run(self):
+        """ Add logger to spawned process """
+        logger_init = self._kwargs["log_init"]
+        log_queue = self._kwargs["log_queue"]
+        log_level = self._kwargs["log_level"]
+        logger_init(log_level, log_queue)
+        super().run()
 
     def start(self):
         """ Add logging to start function """
@@ -117,6 +125,8 @@ class FSThread(threading.Thread):
                 self._target(*self._args, **self._kwargs)
         except Exception:  # pylint: disable=broad-except
             self.err = sys.exc_info()
+            logger.debug("Error in thread (%s): %s", self._name,
+                         self.err[1].with_traceback(self.err[2]))
         finally:
             # Avoid a refcycle if the thread is running a function with
             # an argument that has a member that points to the thread.
@@ -126,8 +136,8 @@ class FSThread(threading.Thread):
 class MultiThread():
     """ Threading for IO heavy ops
         Catches errors in thread and rethrows to parent """
-    def __init__(self, target, *args, thread_count=1, **kwargs):
-        self._name = target.__name__
+    def __init__(self, target, *args, thread_count=1, name=None, **kwargs):
+        self._name = name if name else target.__name__
         logger.debug("Initializing %s: (target: '%s', thread_count: %s)",
                      self.__class__.__name__, self._name, thread_count)
         logger.trace("args: %s, kwargs: %s", args, kwargs)
@@ -138,6 +148,16 @@ class MultiThread():
         self._args = args
         self._kwargs = kwargs
         logger.debug("Initialized %s: '%s'", self.__class__.__name__, self._name)
+
+    @property
+    def has_error(self):
+        """ Return true if a thread has errored, otherwise false """
+        return any(thread.err for thread in self._threads)
+
+    @property
+    def errors(self):
+        """ Return a list of thread errors """
+        return [thread.err for thread in self._threads]
 
     def start(self):
         """ Start a thread with the given method and args """
